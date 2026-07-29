@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: tds-p1-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: AIPIPE_TOKEN
+        sync: false
+      - key: AIPIPE_BASE_URL
+        value: https://aipipe.org/openai/v1
+      - key: AIPIPE_MODEL
+        value: gpt-4o-mini
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
