@@ -17,5 +17,6 @@ services:
         value: gpt-4o-mini
       - key: PUBLIC_BASE_URL
         sync: false
+        # Optional if RENDER_EXTERNAL_URL is enough; set explicitly after first deploy.
       - key: PYTHON_VERSION
         value: "3.11.9"

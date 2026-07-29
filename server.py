@@ -47,7 +47,13 @@ def root() -> PlainTextResponse:
 
 
 def public_base_url() -> str:
-    return os.environ.get("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+    # Prefer explicit PUBLIC_BASE_URL; on Render, RENDER_EXTERNAL_URL is set automatically.
+    raw = (
+        os.environ.get("PUBLIC_BASE_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or "http://127.0.0.1:8000"
+    )
+    return raw.rstrip("/")
 
 
 def log_url_for(run_id: str) -> str:
