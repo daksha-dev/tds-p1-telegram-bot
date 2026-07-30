@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 from collections import defaultdict, deque
 
 from dotenv import load_dotenv
@@ -13,10 +14,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 import uvicorn
 
-from agent import analyze, build_portal_reply
+from agent import RunLogger, analyze, build_portal_reply
 from server import app as fastapi_app, log_url_for
 
 logging.basicConfig(
@@ -25,7 +32,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("bot")
 
-# chat_id -> recent user/assistant turns (for multi-turn grading)
 _history: dict[int, deque] = defaultdict(lambda: deque(maxlen=12))
 
 FINAL_HINT = re.compile(
@@ -40,7 +46,6 @@ def _wants_final_json(text: str) -> bool:
         return True
     if FINAL_HINT.search(text):
         return True
-    # Single-shot analysis questions without explicit "json" still need an answer
     if any(
         k in t
         for k in (
@@ -59,6 +64,13 @@ def _wants_final_json(text: str) -> bool:
     return False
 
 
+async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        await update.message.reply_text(
+            "Bot online. Send a data-analysis question; I reply with one JSON object."
+        )
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
@@ -69,14 +81,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _history[chat_id].append({"role": "user", "content": text})
 
     if not _wants_final_json(text):
-        # Intermediate multi-turn step
         ack = "OK. Ready for the next instruction."
         _history[chat_id].append({"role": "assistant", "content": ack})
         await update.message.reply_text(ack)
         return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
     messages = list(_history[chat_id])
 
     def _run():
@@ -86,67 +96,58 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         answer_obj, logger = await asyncio.to_thread(_run)
     except Exception as e:
         log.exception("agent failed")
-        # Still return valid portal JSON so graders see format_ok-ish structure
-        from agent import RunLogger, build_portal_reply as bpr
-
         logger = RunLogger()
         logger.log("error", error=str(e))
         answer_obj = {"answer": {"error": str(e)}}
-        url = log_url_for(logger.run_id)
-        await update.message.reply_text(bpr(answer_obj, url))
-        return
 
     url = log_url_for(logger.run_id)
     reply = build_portal_reply(answer_obj, url)
     _history[chat_id].append({"role": "assistant", "content": reply})
-    # Exactly one JSON object — no extra text
     await update.message.reply_text(reply)
 
 
-async def _run_api(port: int) -> None:
-    config = uvicorn.Config(
-        fastapi_app,
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        lifespan="off",
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
-async def main_async() -> None:
+def _run_telegram() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
 
-    port = int(os.environ.get("PORT", "8000"))
-    api_task = asyncio.create_task(_run_api(port))
+    async def _amain() -> None:
+        application = (
+            Application.builder()
+            .token(token)
+            .connect_timeout(60)
+            .read_timeout(60)
+            .write_timeout(60)
+            .pool_timeout(60)
+            .build()
+        )
+        application.add_handler(CommandHandler("start", on_start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    application = (
-        Application.builder()
-        .token(token)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+        # Critical: clear any webhook so long-polling receives messages
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook cleared; starting polling as @%s", (await application.bot.get_me()).username)
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    log.info("Telegram polling started; HTTP on :%s", port)
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        # Keep this thread's event loop alive
+        await asyncio.Event().wait()
 
-    try:
-        await api_task
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    asyncio.run(_amain())
 
 
 def main() -> None:
-    asyncio.run(main_async())
+    if not os.environ.get("TELEGRAM_BOT_TOKEN"):
+        raise SystemExit("TELEGRAM_BOT_TOKEN is required")
+    if not (os.environ.get("AIPIPE_TOKEN") or os.environ.get("OPENAI_API_KEY")):
+        log.warning("AIPIPE_TOKEN missing — analysis replies will error until set")
+
+    port = int(os.environ.get("PORT", "8000"))
+    t = threading.Thread(target=_run_telegram, name="telegram-polling", daemon=True)
+    t.start()
+    log.info("HTTP listening on 0.0.0.0:%s", port)
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port, log_level="info")
 
 
 if __name__ == "__main__":
